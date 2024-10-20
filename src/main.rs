@@ -8,7 +8,7 @@ use std::{
 use egglog::{
     actions::{Instruction, Load, Program},
     ast::{Expr, Literal, Symbol, DUMMY_SPAN},
-    constraint::SimpleTypeConstraint,
+    constraint::AllEqualTypeConstraint,
     core::{AtomTerm, GenericAtom, SymbolOrEq},
     sort::{FromSort, StringSort, UnitSort},
     EGraph, PrimitiveLike, TermId, Value,
@@ -26,12 +26,10 @@ impl PrimitiveLike for KeepBest {
         &self,
         span: &egglog::ast::Span,
     ) -> Box<dyn egglog::constraint::TypeConstraint> {
-        SimpleTypeConstraint::new(
-            "keep-best".into(),
-            vec![self.0.clone(), self.1.clone()],
-            span.clone(),
-        )
-        .into_box()
+        AllEqualTypeConstraint::new("keep-best".into(), span.clone())
+            .with_all_arguments_sort(self.0.clone())
+            .with_output_sort(self.1.clone())
+            .into_box()
     }
 
     fn apply(
@@ -41,27 +39,38 @@ impl PrimitiveLike for KeepBest {
     ) -> Option<egglog::Value> {
         let egraph = egraph.unwrap();
 
-        // Step 1: Get the root expression
-        assert!(values.len() == 1);
-        let root_var = Symbol::load(&self.0, &values[0]);
-        let (_root_sort, root) = egraph.eval_expr(&Expr::var_no_span(root_var)).unwrap();
-        let (termdag, term) = egraph.extract_value(root);
+        // every element of terms contain four things
+        //   * name of the root variable
+        //   * TermDag
+        //   * Term
+        //   * A vec `is_subterm` showing for each index if that of the TermDag
+        //     is a subterm of the actual extracted term.
+        //     This keeps the database compact by only inserting meaningful tuples to the database later.
+        let mut terms = vec![];
+        for value in values {
+            // Step 1: Get the root expression
+            let root_var = Symbol::load(&self.0, &value);
+            let (_root_sort, root) = egraph.eval_expr(&Expr::var_no_span(root_var)).unwrap();
+            let (termdag, term) = egraph.extract_value(root);
 
-        // Step 2: Keep only the subterms of the extracted term
-        let mut is_subterm = HashSet::<TermId>::default();
-        let mut q = VecDeque::<TermId>::default();
-        q.push_back(termdag.lookup(&term));
-        while !q.is_empty() {
-            let curr = q.pop_front().unwrap();
-            if is_subterm.contains(&curr) {
-                continue;
-            }
-            is_subterm.insert(curr);
-            if let egglog::Term::App(_, args) = &termdag.nodes[curr] {
-                for arg in args {
-                    q.push_back(*arg);
+            // Step 2: Keep only the subterms of the extracted term
+            let mut is_subterm = HashSet::<TermId>::default();
+            let mut q = VecDeque::<TermId>::default();
+            q.push_back(termdag.lookup(&term));
+            while !q.is_empty() {
+                let curr = q.pop_front().unwrap();
+                if is_subterm.contains(&curr) {
+                    continue;
+                }
+                is_subterm.insert(curr);
+                if let egglog::Term::App(_, args) = &termdag.nodes[curr] {
+                    for arg in args {
+                        q.push_back(*arg);
+                    }
                 }
             }
+
+            terms.push((root_var, termdag, term, is_subterm));
         }
 
         // Step 3: Clear the egraph
@@ -69,129 +78,135 @@ impl PrimitiveLike for KeepBest {
             function.clear();
         }
 
-        // Step 4: Figure out the type of the extracted term
-        // Useful for determining which primitive to apply when there are multiple primitives
-        let assignment = {
-            let mut problem = egglog::constraint::Problem::default();
-            let mut atoms = vec![];
+        for (root_var, termdag, term, is_subterm) in terms.into_iter() {
+            // Step 4: Figure out the type of the extracted term
+            // Useful for determining which primitive to apply when there are multiple primitives
+            let assignment = {
+                let mut problem = egglog::constraint::Problem::default();
+                let mut atoms = vec![];
+                for (termid, term) in termdag.nodes.iter().enumerate() {
+                    if !is_subterm.contains(&termid) {
+                        continue;
+                    }
+                    let var =
+                        AtomTerm::Var(DUMMY_SPAN.clone(), format!("$halide${termid}$").into());
+                    let atom = match term {
+                        egglog::Term::Lit(lit) => vec![GenericAtom {
+                            span: DUMMY_SPAN.clone(),
+                            head: SymbolOrEq::Eq,
+                            args: vec![var, AtomTerm::Literal(DUMMY_SPAN.clone(), lit.clone())],
+                        }],
+                        egglog::Term::Var(_) => {
+                            panic!("Extracted program should not contain variables")
+                        }
+                        egglog::Term::App(head, args) => {
+                            let mut args = args
+                                .iter()
+                                .map(|arg| {
+                                    AtomTerm::Var(
+                                        DUMMY_SPAN.clone(),
+                                        format!("$halide${arg}$").into(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            args.push(AtomTerm::Var(
+                                DUMMY_SPAN.clone(),
+                                format!("$halide${termid}$").into(),
+                            ));
+                            vec![GenericAtom {
+                                span: DUMMY_SPAN.clone(),
+                                head: SymbolOrEq::Symbol(head.clone()),
+                                args,
+                            }]
+                        }
+                    };
+                    atoms.extend(atom);
+                }
+                let query = egglog::core::Query { atoms };
+                problem.add_query(&query, &egraph.type_info).unwrap();
+                problem
+                    .solve(|sort| sort.name())
+                    .map_err(|e| e.to_type_error())
+                    .unwrap()
+            };
+
+            // Step 5: insert the optimal program back to the egraph
+            let mut termid_to_value_cache = HashMap::<TermId, Value>::default();
             for (termid, term) in termdag.nodes.iter().enumerate() {
                 if !is_subterm.contains(&termid) {
                     continue;
                 }
-                let var = AtomTerm::Var(DUMMY_SPAN.clone(), format!("$halide${termid}$").into());
-                let atom = match term {
-                    egglog::Term::Lit(lit) => vec![GenericAtom {
-                        span: DUMMY_SPAN.clone(),
-                        head: SymbolOrEq::Eq,
-                        args: vec![var, AtomTerm::Literal(DUMMY_SPAN.clone(), lit.clone())],
-                    }],
+                let value = match term {
+                    egglog::Term::Lit(literal) => egraph.eval_lit(&literal),
                     egglog::Term::Var(_) => {
                         panic!("Extracted program should not contain variables")
                     }
                     egglog::Term::App(head, args) => {
-                        let mut args = args
+                        // Step 5.1: Get the args
+                        let args = args
                             .iter()
-                            .map(|arg| {
-                                AtomTerm::Var(DUMMY_SPAN.clone(), format!("$halide${arg}$").into())
-                            })
+                            .map(|arg| termid_to_value_cache.get(arg).unwrap().clone())
                             .collect::<Vec<_>>();
-                        args.push(AtomTerm::Var(
-                            DUMMY_SPAN.clone(),
-                            format!("$halide${termid}$").into(),
-                        ));
-                        vec![GenericAtom {
-                            span: DUMMY_SPAN.clone(),
-                            head: SymbolOrEq::Symbol(head.clone()),
-                            args,
-                        }]
-                    }
-                };
-                atoms.extend(atom);
-            }
-            let query = egglog::core::Query { atoms };
-            problem.add_query(&query, &egraph.type_info).unwrap();
-            problem
-                .solve(|sort| sort.name())
-                .map_err(|e| e.to_type_error())
-                .unwrap()
-        };
 
-        // Step 5: insert the optimal program back to the egraph
-        let mut termid_to_value_cache = HashMap::<TermId, Value>::default();
-        for (termid, term) in termdag.nodes.iter().enumerate() {
-            if !is_subterm.contains(&termid) {
-                continue;
-            }
-            let value = match term {
-                egglog::Term::Lit(literal) => egraph.eval_lit(&literal),
-                egglog::Term::Var(_) => {
-                    panic!("Extracted program should not contain variables")
-                }
-                egglog::Term::App(head, args) => {
-                    // Step 5.1: Get the args
-                    let args = args
-                        .iter()
-                        .map(|arg| termid_to_value_cache.get(arg).unwrap().clone())
-                        .collect::<Vec<_>>();
+                        let mut instructions = vec![];
 
-                    let mut instructions = vec![];
-
-                    // Step 5.2: Load the args to the stack
-                    for i in 0..args.len() {
-                        instructions.push(Instruction::Load(Load::Subst(i)));
-                    }
-                    // Step 5.3: Generate Call* instructions for either function or primitive
-                    if egraph.functions.contains_key(head) {
-                        instructions.push(Instruction::CallFunction(*head, true));
-                    } else {
-                        let primitives = egraph.type_info.primitives.get(head).unwrap();
-                        let mut arg_sorts = args
-                            .iter()
-                            .map(|arg| egraph.get_sort_from_value(arg).unwrap().clone())
-                            .collect::<Vec<_>>();
-                        arg_sorts.push(
-                            assignment
-                                .0
-                                .get(&AtomTerm::Var(
-                                    DUMMY_SPAN.clone(),
-                                    format!("$halide${termid}$").into(),
-                                ))
-                                .unwrap()
-                                .clone(),
-                        );
-                        let mut found = false;
-                        for primitive in primitives {
-                            if primitive.accept(&arg_sorts, &egraph.type_info) {
-                                instructions.push(Instruction::CallPrimitive(
-                                    primitive.clone(),
-                                    args.len(),
-                                ));
-                                found = true;
-                                break;
+                        // Step 5.2: Load the args to the stack
+                        for i in 0..args.len() {
+                            instructions.push(Instruction::Load(Load::Subst(i)));
+                        }
+                        // Step 5.3: Generate Call* instructions for either function or primitive
+                        if egraph.functions.contains_key(head) {
+                            instructions.push(Instruction::CallFunction(*head, true));
+                        } else {
+                            let primitives = egraph.type_info.primitives.get(head).unwrap();
+                            let mut arg_sorts = args
+                                .iter()
+                                .map(|arg| egraph.get_sort_from_value(arg).unwrap().clone())
+                                .collect::<Vec<_>>();
+                            arg_sorts.push(
+                                assignment
+                                    .0
+                                    .get(&AtomTerm::Var(
+                                        DUMMY_SPAN.clone(),
+                                        format!("$halide${termid}$").into(),
+                                    ))
+                                    .unwrap()
+                                    .clone(),
+                            );
+                            let mut found = false;
+                            for primitive in primitives {
+                                if primitive.accept(&arg_sorts, &egraph.type_info) {
+                                    instructions.push(Instruction::CallPrimitive(
+                                        primitive.clone(),
+                                        args.len(),
+                                    ));
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                panic!("No primitive found for {:?}", head);
                             }
                         }
-                        if !found {
-                            panic!("No primitive found for {:?}", head);
-                        }
-                    }
 
-                    // Step 5.4: Run the instructions and get the output
-                    let mut out = vec![];
-                    egraph
-                        .run_actions(&mut out, &args, &Program::new(instructions))
-                        .unwrap();
-                    out.pop().unwrap()
-                }
-            };
-            termid_to_value_cache.insert(termid, value);
+                        // Step 5.4: Run the instructions and get the output
+                        let mut out = vec![];
+                        egraph
+                            .run_actions(&mut out, &args, &Program::new(instructions))
+                            .unwrap();
+                        out.pop().unwrap()
+                    }
+                };
+                termid_to_value_cache.insert(termid, value);
+            }
+            // Union the root variable with the inserted expression
+            // NB: This depends on let-bindings be implemented as function tables
+            egraph.functions.get_mut(&root_var).unwrap().insert(
+                &[],
+                *termid_to_value_cache.get(&termdag.lookup(&term)).unwrap(),
+                egraph.timestamp,
+            );
         }
-        // Union the root variable with the inserted expression
-        // NB: This depends on let-bindings be implemented as function tables
-        egraph.functions.get_mut(&root_var).unwrap().insert(
-            &[],
-            *termid_to_value_cache.get(&termdag.lookup(&term)).unwrap(),
-            egraph.timestamp,
-        );
 
         Some(egraph.eval_lit(&Literal::Unit))
     }

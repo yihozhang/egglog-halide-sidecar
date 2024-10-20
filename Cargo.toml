@@ -1,0 +1,13 @@
+[package]
+name = "egglog-halide-sidecar"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["bin"]
+bin = ["dep:env_logger"]
+
+[dependencies]
+env_logger = { version = "0.10", optional = true }
+egglog = { path = "../egglog/"}
+log = "0.4"
